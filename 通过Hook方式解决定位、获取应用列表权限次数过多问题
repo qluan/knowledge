@@ -1,0 +1,257 @@
+一、背景
+网信办发现豆瓣App存在频繁调用用户地理位置信息的情况，1分钟调用81次；另外在启动时会调用应用安装列表，没有明显的业务需求，与场景不合。要求我们限期整改
+二、分析
+1、启动获取应用安装列表问题
+问题是通过小米系统的权限访问纪录得知，所以第一步需要确定哪些方法的访问在小米系统上会认定为“访问应用安装列表”
+1)、确认方法调用
+通过demo app，依次调用PackageManager中的以下方法，查看小米系统上的显示情况
+PackageManager.getPackageInfo()
+PackageManager.getInstalledPackages()
+PackageManager.getInstalledApplications()
+
+经确认getPackageInfo获取单个应用安装状态不会认定为读取安装列表，另外两个获取全部安装信息的方法会触发，所以就定位到另外两个方法的调用上。
+2)、查找调用地方
+查找调用的地方通常有下面几个方法
+1. 静态代码查找：apk->jar->搜索相应方法，查找调用地方，适合调用点不多的情况定位
+2. hook方式注入log日志：适合解调用时机问题
+在这里因为我们要解决调用时机问题，使用hook的方式检查更高效一些，避免陷入代码逻辑猜测的循环。
+
+Hook从机制上分为两种，一种是静态hook，原理是编译打包时修改class代码注入log代码，适用于我们自己的代码和第三方代码，例如epic框架； 另外一种是动态hook，原理是运行时通过反射修改某个接口实现，除了适用于自己的代码也适用于不参与编译打包的framework层的代码，但是需要找到合适的hook点。
+
+3)、确定PackageManager的hook方案
+PackageManager是通过Context.getPackageManager()获取的,Context的实现类是ContextImpl,
+   private PackageManager mPackageManager;
+     @Override
+    public PackageManager getPackageManager() {
+        if (mPackageManager != null) {
+            return mPackageManager;
+        }
+
+        final IPackageManager pm = ActivityThread.getPackageManager();
+        if (pm != null) {
+            // Doesn't matter if we make more than one instance.
+            return (mPackageManager = new ApplicationPackageManager(this, pm));
+        }
+
+        return null;
+    }
+
+mPackageManager是抽象类，不是接口无法hook，继续看ActivityThread.getPackageManager()
+static volatile IPackageManager sPackageManager;
+     @UnsupportedAppUsage
+    public static IPackageManager getPackageManager() {
+        if (sPackageManager != null) {
+            return sPackageManager;
+        }
+        final IBinder b = ServiceManager.getService("package");
+        sPackageManager = IPackageManager.Stub.asInterface(b);
+        return sPackageManager;
+    }
+
+sPackageManager是一个接口，可以使用动态hook方式hook掉，这是一个很好的hook点。
+4)、Hook方案实现
+
+public static final void hookPackageManager() {
+    try {
+        Class packageManagerClazz = Class.forName("android.app.ActivityThread");
+        Field sPackageManagerField = packageManagerClazz.getDeclaredField("sPackageManager");
+        sPackageManagerField.setAccessible(true);
+
+        Object oldPackageManager = sPackageManagerField.get(null);
+        Class IPackageManagerClazz = Class.forName("android.content.pm.IPackageManager");
+
+        Object newPackageManager = Proxy.newProxyInstance(ClassLoader.getSystemClassLoader(), new Class[]{IPackageManagerClazz}, new InvocationHandler() {
+            @Override
+            public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+                if (method.getName().contains("getInstalledPackages") || method.getName().equals("getInstalledApplications")) {
+                    Log.i("xxx", "packageManager method call : " + method);
+                    StackTraceElement[] stackTraceElements = Thread.currentThread().getStackTrace();
+                    int count = Math.min(10, stackTraceElements.length);
+                    for (int i = 0; i < count ; i ++) {
+                        Log.i("xxx", "packageManager method call stacktrace : " + stackTraceElements[i].getClassName() + "-"+stackTraceElements[i].getMethodName());
+                    }
+                }
+                return method.invoke(oldPackageManager, args);
+            }
+        });
+        sPackageManagerField.set(null, newPackageManager);
+
+    } catch (ClassNotFoundException | NoSuchFieldException | IllegalAccessException e) {
+        e.printStackTrace();
+    }
+}
+
+由于PackageManager是Application 级service，全进程共享一个，所以hook点可以放到application或者任意activity一个地方即可。
+
+由于PackageManager有缓存，所以最好放在application最早启动的地方避免提前初始化。如果提前初始化了，可以反射方法将Context和ActivityThread中的缓存清空。
+
+5)、log问题分析
+经过log分析是推送SDK初始化时，会调用安装的应用列表，移除即可。
+
+2、频繁获取定位分析
+频繁获取定位的问题是通过华为手机的权限访问记录看到的，现象比较诡异
+1. 无法稳定复现，访问一个页面有可能有，有可能没有；有可能+1次，有可能+4次
+2. 存在机型问题；在其他手机上并未有类似提示，有可能是统计工具问题，也有可能是业务问题
+
+第一步还是要确认哪些方法调用会认定为获取用户位置信息
+1)、确认方法调用
+通过跟华为方沟通及demo app测试，发现了4个方法会触发地理位置方法调用次数+1，分别是
+locationManager.getLastKnownLocation(provider)
+locationManager.requestLocationUpdates()
+wifiManager.getScanResults() 
+wifiManager.getConnectionInfo()
+
+前3个方法是向华为问到的，第4个躺了解决前3个之后问题依然很存在，绝望之余试出来的，也是调用量最大的一个。
+最终确定为上述4个方法。
+ 
+2)、查找调用的地方
+由于LocationManager和WifiManager都是SDK中的方法，只能使用动态Hook的方式去插入log。
+
+3)、WifiManager的hook点和相关代码
+IWifiManager mService;
+public List<ScanResult> getScanResults() {
+    try {
+        return mService.getScanResults(mContext.getOpPackageName(),
+                mContext.getAttributionTag());
+    } catch (RemoteException e) {
+        throw e.rethrowFromSystemServer();
+    }
+}
+
+
+同PackageManager的hook方式一样，有如下hook代码
+
+public static final void hookWifiManager(Context context) {
+    try {
+        WifiManager wifiManager = (WifiManager) context.getSystemService(Context.WIFI_SERVICE);
+        Class wifiManagerClazz = Class.forName("android.net.wifi.WifiManager");
+        Field mServiceField = wifiManagerClazz.getDeclaredField("mService");
+        mServiceField.setAccessible(true);
+
+        Object oldWifiManager = mServiceField.get(wifiManager);
+        Class IWifiManagerClazz = Class.forName("android.net.wifi.IWifiManager");
+
+        Object newWifiManager = Proxy.newProxyInstance(ClassLoader.getSystemClassLoader(), new Class[]{IWifiManagerClazz}, new InvocationHandler() {
+            @Override
+            public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+                if (method.getName().contains("getScanResults") || method.getName().equals("getConnectionInfo")) {
+                    Log.i("xxx", "wifiManager method call : " + method);
+                    StackTraceElement[] stackTraceElements = Thread.currentThread().getStackTrace();
+                    int count = Math.min(10, stackTraceElements.length);
+                    for (int i = 0; i < count ; i ++) {
+                        Log.i("xxx", "wifiManager method call stacktrace : " + stackTraceElements[i].getClassName() + "-"+stackTraceElements[i].getMethodName());
+                    }
+                }
+                return method.invoke(oldWifiManager, args);
+            }
+        });
+        mServiceField.set(wifiManager, newWifiManager);
+
+    } catch (ClassNotFoundException | NoSuchFieldException | IllegalAccessException e) {
+        e.printStackTrace();
+    }
+}
+
+会发现此时的hook，需要传入一个特定的Context对象，因为wifiManager是跟一个context绑定的。那么就有一个问题，就要在每个context都要执行一下hook方法吗？有没有一行代码全局hook的方案？
+
+这里需要继续看WifiManager这类系统服务的注册、获取以及对应的缓存机制。
+ContextImpl.getSystemService()
+@Override
+    public Object getSystemService(String name) {
+        if (vmIncorrectContextUseEnabled()) {
+            // Check incorrect Context usage.
+            if (WINDOW_SERVICE.equals(name) && !isUiContext()) {
+                final String errorMessage = "Tried to access visual service "
+                        + SystemServiceRegistry.getSystemServiceClassName(name)
+                        + " from a non-visual Context:" + getOuterContext();
+                final String message = "WindowManager should be accessed from Activity or other "
+                        + "visual Context. Use an Activity or a Context created with "
+                        + "Context#createWindowContext(int, Bundle), which are adjusted to "
+                        + "the configuration and visual bounds of an area on screen.";
+                final Exception exception = new IllegalAccessException(errorMessage);
+                StrictMode.onIncorrectContextUsed(message, exception);
+                Log.e(TAG, errorMessage + " " + message, exception);
+            }
+        }
+        return SystemServiceRegistry.getSystemService(this, name);
+    }
+
+调用SystemServiceRegistry.getSystemService()
+public static Object getSystemService(ContextImpl ctx, String name) {
+        if (name == null) {
+            return null;
+        }
+        final ServiceFetcher<?> fetcher = SYSTEM_SERVICE_FETCHERS.get(name);
+        if (fetcher == null) {
+            if (sEnableServiceNotFoundWtf) {
+                Slog.wtf(TAG, "Unknown manager requested: " + name);
+            }
+            return null;
+        }
+
+        final Object ret = fetcher.getService(ctx);
+        if (sEnableServiceNotFoundWtf && ret == null) {
+            // Some services do return null in certain situations, so don't do WTF for them.
+            switch (name) {
+                case Context.CONTENT_CAPTURE_MANAGER_SERVICE:
+                case Context.APP_PREDICTION_SERVICE:
+                case Context.INCREMENTAL_SERVICE:
+                case Context.ETHERNET_SERVICE:
+                    return null;
+            }
+            Slog.wtf(TAG, "Manager wrapper not available: " + name);
+            return null;
+        }
+        return ret;
+    }
+
+继续观察SYSTEM_SERVICE_FETCHERS里面注册了各种服务，注册服务又分为ServiceFetcher、CachedServiceFetcher、StaticServiceFetcher` 的区别，主要氛围2种情况
+1、有些service依赖context，会在context中存储着一份instance实例，如LOCATION_SERVICE、WIFI_SERVICE
+2、有些service不依赖context，进程共用一份实例，如INPUT_SERVICE
+
+要实现全局hook，有两种做法
+做法一：可以在application和activit的基类最开始的地方，调用上面hook方法;
+做法二：替换SYSTEM_SERVICE_FETCHERS中WIFI_SERVICE的实例，这里返回的是各个wifiManager实例的地方，可以在这里加统一hook。
+
+代码
+
+private static final void hookSystemServiceRegister(Context context) {
+    try {
+        Class registerServiceClazz = Class.forName("android.app.SystemServiceRegistry");
+        Field field = registerServiceClazz.getDeclaredField("SYSTEM_SERVICE_FETCHERS");
+        field.setAccessible(true);
+        Object rawServiceFetcherMap = field.get(null);
+        if (rawServiceFetcherMap instanceof ArrayMap) {
+            Object locationFetcher = ((ArrayMap<?, ?>) rawServiceFetcherMap).get(Context.LOCATION_SERVICE);
+            Class serviceFetcherClazz = Class.forName("android.app.SystemServiceRegistry$ServiceFetcher");
+            Object newObject = Proxy.newProxyInstance(Thread.currentThread().getContextClassLoader(),
+                    new Class[]{serviceFetcherClazz}, new InvocationHandler() {
+                        @Override
+                        public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+                            if (method.getName().equals("getService")) {
+                                Object result = method.invoke(locationFetcher, args);
+                                HookHelper.hookLocationManager((LocationManager) result);
+                                return result;
+                            }
+                            return method.invoke(locationFetcher, args);
+                        }
+                    });
+            if (((ArrayMap<String, Object>) rawServiceFetcherMap).put(Context.LOCATION_SERVICE, newObject) == newObject) {
+                Log.i("xxxxx", "service hook success");
+            }
+        }
+    } catch (ClassNotFoundException e) {
+        e.printStackTrace();
+    } catch (NoSuchFieldException e) {
+        e.printStackTrace();
+    } catch (IllegalAccessException e) {
+        e.printStackTrace();
+    }
+}
+
+问题：经测试，hook到SystemServiceRegistry之后，无法获取对应的field，上面代码没有运行成功。
+
+4)、LocationManager的hook点和相关代码
+同WifiManager的实现和逻辑，代码不赘述
+
+由于SystemServiceRegistry没有hook成功，采用第一种方式完全hook
